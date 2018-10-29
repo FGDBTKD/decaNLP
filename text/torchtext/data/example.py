@@ -1,7 +1,20 @@
 import csv
+import sys
 import json
 
 import six
+
+
+def intern_strings(x):
+    if isinstance(x, (list, tuple)):
+        r = []
+        for y in x:
+            if isinstance(y, str):
+                r.append(sys.intern(y))
+            else:
+                r.append(y)
+        return r
+    return x
 
 
 class Example(object):
@@ -26,7 +39,7 @@ class Example(object):
                     vals = [vals]
                 for val in vals:
                     name, field = val
-                    setattr(ex, name, field.preprocess(data[key]))
+                    setattr(ex, name, intern_strings(field.preprocess(data[key])))
         return ex
 
     @classmethod
@@ -58,7 +71,7 @@ class Example(object):
             if field is not None:
                 if isinstance(val, six.string_types):
                     val = val.rstrip('\n')
-                setattr(ex, name, field.preprocess(val))
+                setattr(ex, name, intern_strings(field.preprocess(val)))
         return ex
 
     @classmethod

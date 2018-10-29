@@ -83,11 +83,12 @@ def prepare_data(args, field, logger):
             vocab_sets.extend(split) 
 
     if args.load is None:
-        logger.info(f'Building vocabulary')
+        logger.info(f'Getting pretrained word vectors')
         char_vectors = torchtext.vocab.CharNGram(cache=args.embeddings)
         glove_vectors = torchtext.vocab.GloVe(cache=args.embeddings)
         vectors = [char_vectors, glove_vectors]
         vocab_sets = (train_sets + val_sets) if len(vocab_sets) == 0 else vocab_sets
+        logger.info(f'Building vocabulary')
         FIELD.build_vocab(*vocab_sets, max_size=args.max_effective_vocab, vectors=vectors)
 
     FIELD.decoder_itos = FIELD.vocab.itos[:args.max_generative_vocab]
@@ -107,13 +108,13 @@ def prepare_data(args, field, logger):
     return FIELD, train_sets, val_sets
 
 
-def to_iter(args, world_size, val_batch_size, data, train=True, token_testing=False, sort=None):
+def to_iter(args, world_size, val_batch_size, data, device, train=True, token_testing=False, sort=None):
     sort = sort if not token_testing else True
     shuffle = None if not token_testing else False
     reverse = args.reverse
     Iterator = torchtext.data.BucketIterator if train else torchtext.data.Iterator
     it = Iterator(data, batch_size=val_batch_size, 
-       device=0 if world_size > 0 else -1, batch_size_fn=batch_fn if train else None, 
+       device=device, batch_size_fn=batch_fn if train else None, 
        distributed=world_size>1, train=train, repeat=train, sort=sort, 
        shuffle=shuffle, reverse=args.reverse)
     return it
@@ -132,9 +133,9 @@ def step(model, batch, opt, iteration, field, task, lr=None, grad_clip=None, wri
     if lr is not None:
         opt.param_groups[0]['lr'] = lr
     if grad_clip > 0.0:
-        torch.nn.utils.clip_grad_norm(model.params, grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.params, grad_clip)
     opt.step()
-    return loss.data[0], {}
+    return loss.item(), {}
 
 
 def train(args, model, opt, train_iters, train_iterations, field, rank=0, world_size=1, 
@@ -179,8 +180,8 @@ def train(args, model, opt, train_iters, train_iterations, field, rank=0, world_
                         for val_task_idx, (val_task, val_iter) in enumerate(val_iters):
                             val_loss, metric_dict = validate(val_task, val_iter, model, logger, field, world_size, rank, num_print=args.num_print, args=args)
                             if val_loss is not None:
-                                log_entry = f'{args.timestamp}:{elapsed_time(logger)}:iteration_{iteration}:{round_progress}train_{task}:{task_progress}val_{val_task}:val_loss{val_loss.data[0]:.4f}:'
-                                writer.add_scalars(f'loss/val', {val_task: val_loss.data[0]}, iteration)
+                                log_entry = f'{args.timestamp}:{elapsed_time(logger)}:iteration_{iteration}:{round_progress}train_{task}:{task_progress}val_{val_task}:val_loss{val_loss.item():.4f}:'
+                                writer.add_scalars(f'loss/val', {val_task: val_loss.item()}, iteration)
                             else:
                                 log_entry = f'{args.timestamp}:{elapsed_time(logger)}:iteration_{iteration}:{round_progress}train_{task}:{task_progress}val_{val_task}:'
                                
@@ -199,17 +200,17 @@ def train(args, model, opt, train_iters, train_iterations, field, rank=0, world_
                                     writer.add_scalars(f'{val_task}/{metric_key}', {'val': metric_value}, iteration)
                                     writer.add_scalars(f'{val_task}/val', {f'{metric_key}': metric_value}, iteration)
 
-                        # saving
-                        if save_every is not None and (iteration % args.save_every == 0 % args.save_every):
-                            if world_size > 1:
-                                torch.distributed.barrier() 
-                            if rank is not None and rank == 0:
-                                torch.save({'model_state_dict': model.state_dict(), 'field': field}, os.path.join(args.log_dir, f'iteration_{iteration}.pth'))
-                            if world_size > 1:
-                                torch.distributed.barrier() 
-                            torch.save(opt.state_dict(), os.path.join(args.log_dir, f'iteration_{iteration}_rank_{rank}_optim.pth'))
-                            if world_size > 1:
-                                torch.distributed.barrier() 
+                    # saving
+                    if save_every is not None and (iteration % args.save_every == 0 % args.save_every):
+                        if world_size > 1:
+                            torch.distributed.barrier() 
+                        if rank is not None and rank == 0:
+                            torch.save({'model_state_dict': {k: v.cpu() for k, v in model.state_dict().items()}, 'field': field}, os.path.join(args.log_dir, f'iteration_{iteration}.pth'))
+                        if world_size > 1:
+                            torch.distributed.barrier() 
+                        torch.save(opt.state_dict(), os.path.join(args.log_dir, f'iteration_{iteration}_rank_{rank}_optim.pth'))
+                        if world_size > 1:
+                            torch.distributed.barrier() 
 
                     # lr update
                     lr = opt.param_groups[0]['lr'] 
@@ -274,22 +275,25 @@ def train(args, model, opt, train_iters, train_iterations, field, rank=0, world_
 
 
 def run(args, run_args, rank=0, world_size=1):
-    set_seed(args, rank=rank)
+    device = set_seed(args, rank=rank)
     logger = initialize_logger(args, rank)
     field, train_sets, val_sets, save_dict = run_args
 
     logger.start = time.time()
 
     logger.info(f'Preparing iterators')
-    train_iters = [(name, to_iter(args, world_size, tok, x, token_testing=args.token_testing)) 
+    train_iters = [(name, to_iter(args, world_size, tok, x, device, token_testing=args.token_testing)) 
                       for name, x, tok in zip(args.train_tasks, train_sets, args.train_batch_tokens)]
-    val_iters = [(name, to_iter(args, world_size, tok, x, train=False, token_testing=args.token_testing, sort=False if 'sql' in name else None))
+    val_iters = [(name, to_iter(args, world_size, tok, x, device, train=False, token_testing=args.token_testing, sort=False if 'sql' in name else None))
                     for name, x, tok in zip(args.val_tasks, val_sets, args.val_batch_size)]
 
-    logger.info(f'Initializing Writer')
-    writer = SummaryWriter(log_dir=args.log_dir)
+    if hasattr(args, 'tensorboard') and args.tensorboard:
+        logger.info(f'Initializing Writer')
+        writer = SummaryWriter(log_dir=args.log_dir)
+    else:
+        writer = None
 
-    model = init_model(args, field, logger, world_size)
+    model = init_model(args, field, logger, world_size, device)
     opt = init_opt(args, model) 
     start_iteration = 1
 
@@ -309,16 +313,15 @@ def run(args, run_args, rank=0, world_size=1):
         writer=writer if rank==0 else None, save_every=args.save_every, start_iteration=start_iteration)
 
 
-def init_model(args, field, logger, world_size):
+def init_model(args, field, logger, world_size, device):
     logger.info(f'Initializing {args.model}')
     Model = getattr(models, args.model) 
     model = Model(field, args)
     params = get_trainable_params(model) 
     num_param = count_params(params)
-    logger.info(f'{args.model} has {num_param:,} parameters')
+    logger.info(f'{args.model} has {num_param:,} trainable parameters')
 
-    if args.gpus[0] > -1:
-        model.cuda()
+    model.to(device)
     if world_size > 1: 
         logger.info(f'Wrapping model for distributed')
         model = DistributedDataParallel(model)
@@ -352,7 +355,7 @@ def main():
     field, train_sets, val_sets = prepare_data(args, field, logger)
 
     run_args = (field, train_sets, val_sets, save_dict)
-    if len(args.gpus) > 1:
+    if len(args.devices) > 1:
         logger.info(f'Multiprocessing')
         mp = Multiprocess(run, args)
         mp.run(run_args)

@@ -51,10 +51,10 @@ def prepare_data(args, FIELD):
     return FIELD, splits
 
 
-def to_iter(data, bs):
+def to_iter(data, bs, device):
     Iterator = torchtext.data.Iterator
     it = Iterator(data, batch_size=bs, 
-       device=0, batch_size_fn=None, 
+       device=device, batch_size_fn=None, 
        train=False, repeat=False, sort=None, 
        shuffle=None, reverse=False)
 
@@ -62,9 +62,11 @@ def to_iter(data, bs):
 
 
 def run(args, field, val_sets, model):
-    set_seed(args)
+    device = set_seed(args)
     print(f'Preparing iterators')
-    iters = [(name, to_iter(x, bs)) for name, x, bs in zip(args.tasks, val_sets, args.val_batch_size)]
+    if len(args.val_batch_size) == 1 and len(val_sets) > 1:
+        args.val_batch_size *= len(val_sets)
+    iters = [(name, to_iter(x, bs, device)) for name, x, bs in zip(args.tasks, val_sets, args.val_batch_size)]
  
     def mult(ps):
         r = 0
@@ -77,107 +79,146 @@ def run(args, field, val_sets, model):
     params = list(filter(lambda p: p.requires_grad, model.parameters()))
     num_param = mult(params)
     print(f'{args.model} has {num_param:,} parameters')
-    if args.gpus > -1:
-        model.cuda()
+    model.to(device)
 
     model.eval()
-    for task, it in iters:
-        prediction_file_name = os.path.join(os.path.splitext(args.best_checkpoint)[0], args.evaluate, task + '.txt')
-        answer_file_name = os.path.join(os.path.splitext(args.best_checkpoint)[0], args.evaluate, task + '.gold.txt')
-        results_file_name = answer_file_name.replace('gold', 'results')
-        if os.path.exists(prediction_file_name):
-            print('** ', prediction_file_name, ' already exists**')
-        if os.path.exists(answer_file_name):
-            print('** ', answer_file_name, ' already exists**')
-        if os.path.exists(results_file_name):
-            print('** ', results_file_name, ' already exists**')
-            with open(results_file_name) as results_file:
-              for l in results_file:
-                  print(l)
-            continue
-        for x in [prediction_file_name, answer_file_name, results_file_name]:
-            os.makedirs(os.path.dirname(x), exist_ok=True)
+    with torch.no_grad():
+        for task, it in iters:
+            print(task)
+            prediction_file_name = os.path.join(os.path.splitext(args.best_checkpoint)[0], args.evaluate, task + '.txt')
+            answer_file_name = os.path.join(os.path.splitext(args.best_checkpoint)[0], args.evaluate, task + '.gold.txt')
+            results_file_name = answer_file_name.replace('gold', 'results')
+            if 'sql' in task or 'squad' in task:
+                ids_file_name = answer_file_name.replace('gold', 'ids')
+            if os.path.exists(prediction_file_name):
+                print('** ', prediction_file_name, ' already exists -- this is where predictions are stored **')
+            if os.path.exists(answer_file_name):
+                print('** ', answer_file_name, ' already exists -- this is where ground truth answers are stored **')
+            if os.path.exists(results_file_name):
+                print('** ', results_file_name, ' already exists -- this is where metrics are stored **')
+                with open(results_file_name) as results_file:
+                  for l in results_file:
+                      print(l)
+                if not 'schema' in task and not args.overwrite_predictions and args.silent:
+                    continue
+            for x in [prediction_file_name, answer_file_name, results_file_name]:
+                os.makedirs(os.path.dirname(x), exist_ok=True)
+    
+            if not os.path.exists(prediction_file_name) or args.overwrite_predictions:
+                with open(prediction_file_name, 'w') as prediction_file:
+                    predictions = []
+                    ids = []
+                    for batch_idx, batch in enumerate(it):
+                        _, p = model(batch)
+                        p = field.reverse(p)
+                        for i, pp in enumerate(p):
+                            if 'sql' in task:
+                                ids.append(int(batch.wikisql_id[i]))
+                            if 'squad' in task:
+                                ids.append(it.dataset.q_ids[int(batch.squad_id[i])])
+                            prediction_file.write(pp + '\n')
+                            predictions.append(pp) 
+            else:
+                with open(prediction_file_name) as prediction_file:
+                    predictions = [x.strip() for x in prediction_file.readlines()] 
+    
+            if 'sql' in task:
+                with open(ids_file_name, 'w') as id_file:
+                    for i in ids:
+                        id_file.write(json.dumps(i) + '\n')
 
-        if not os.path.exists(prediction_file_name):
-            with open(prediction_file_name, 'a') as prediction_file:
-                predictions = []
-                for batch_idx, batch in enumerate(it):
-                    _, p = model(batch)
-                    p = field.reverse(p)
-                    for pp in p:
-                        prediction_file.write(pp + '\n')
-                        predictions.append(pp) 
-        else:
-            with open(prediction_file_name) as prediction_file:
-                predictions = [x.strip() for x in prediction_file.readlines()] 
-
-        def from_all_answers(an):
-            return [it.dataset.all_answers[sid] for sid in an.tolist()] 
-
-        if not os.path.exists(answer_file_name):
-            with open(answer_file_name, 'a') as answer_file:
-                answers = []
-                for batch_idx, batch in enumerate(it):
-                    if hasattr(batch, 'wikisql_id'):
-                        a = from_all_answers(batch.wikisql_id.data.cpu())
-                    elif hasattr(batch, 'squad_id'):
-                        a = from_all_answers(batch.squad_id.data.cpu())
-                    elif hasattr(batch, 'woz_id'):
-                        a = from_all_answers(batch.woz_id.data.cpu())
-                    else:
-                        a = field.reverse(batch.answer.data)
-                    for aa in a:
-                        answers.append(aa) 
-                        answer_file.write(json.dumps(aa) + '\n')
-        else:
-            with open(answer_file_name) as answer_file:
-                answers = [json.loads(x.strip()) for x in answer_file.readlines()] 
-
-        if len(answers) > 0:
-            metrics, answers = compute_metrics(predictions, answers, bleu='iwslt' in task or 'multi30k' in task, dialogue='woz' in task,
-                rouge='cnn' in task, logical_form='sql' in task, corpus_f1='zre' in task, args=args)
-
-            print(metrics)
-            with open(results_file_name, 'w') as results_file:
-                results_file.write(json.dumps(metrics) + '\n')
+            if 'squad' in task:
+                with open(ids_file_name, 'w') as id_file:
+                    for i in ids:
+                        id_file.write(i + '\n')
+   
+            def from_all_answers(an):
+                return [it.dataset.all_answers[sid] for sid in an.tolist()] 
+    
+            if not os.path.exists(answer_file_name):
+                with open(answer_file_name, 'w') as answer_file:
+                    answers = []
+                    for batch_idx, batch in enumerate(it):
+                        if hasattr(batch, 'wikisql_id'):
+                            a = from_all_answers(batch.wikisql_id.data.cpu())
+                        elif hasattr(batch, 'squad_id'):
+                            a = from_all_answers(batch.squad_id.data.cpu())
+                        elif hasattr(batch, 'woz_id'):
+                            a = from_all_answers(batch.woz_id.data.cpu())
+                        else:
+                            a = field.reverse(batch.answer.data)
+                        for aa in a:
+                            answers.append(aa) 
+                            answer_file.write(json.dumps(aa) + '\n')
+            else:
+                with open(answer_file_name) as answer_file:
+                    answers = [json.loads(x.strip()) for x in answer_file.readlines()] 
+    
+            if len(answers) > 0:
+                if not os.path.exists(results_file_name):
+                    metrics, answers = compute_metrics(predictions, answers, bleu='iwslt' in task or 'multi30k' in task or args.bleu, dialogue='woz' in task,
+                        rouge='cnn' in task or 'dailymail' in task or args.rouge, logical_form='sql' in task, corpus_f1='zre' in task, args=args)
+                    with open(results_file_name, 'w') as results_file:
+                        results_file.write(json.dumps(metrics) + '\n')
+                else:
+                    with open(results_file_name) as results_file:
+                        metrics = json.loads(results_file.readlines()[0])
+    
+                if not args.silent:
+                    for i, (p, a) in enumerate(zip(predictions, answers)):
+                        print(f'Prediction {i+1}: {p}\nAnswer {i+1}: {a}\n')
+                print(metrics)
 
 
 def get_args():
     parser = ArgumentParser()
     parser.add_argument('--path', required=True)
     parser.add_argument('--evaluate', type=str, required=True)
-    parser.add_argument('--tasks', default=['wikisql', 'woz.en', 'cnn_dailymail', 'iwslt.en.de', 'zre', 'srl', 'squad', 'sst', 'multinli.in.out'], nargs='+')
-    parser.add_argument('--gpus', type=int, help='gpus to use', required=True)
+    parser.add_argument('--tasks', default=['squad', 'iwslt.en.de', 'cnn_dailymail', 'multinli.in.out', 'sst', 'srl', 'zre', 'woz.en', 'wikisql', 'schema'], nargs='+')
+    parser.add_argument('--devices', default=[0], nargs='+', type=int, help='a list of devices that can be used (multi-gpu currently WIP)')
     parser.add_argument('--seed', default=123, type=int, help='Random seed.')
     parser.add_argument('--data', default='/decaNLP/.data/', type=str, help='where to load data from.')
     parser.add_argument('--embeddings', default='/decaNLP/.embeddings', type=str, help='where to save embeddings.')
+    parser.add_argument('--checkpoint_name')
+    parser.add_argument('--bleu', action='store_true', help='whether to use the bleu metric (always on for iwslt)')
+    parser.add_argument('--rouge', action='store_true', help='whether to use the bleu metric (always on for cnn, dailymail, and cnn_dailymail)')
+    parser.add_argument('--overwrite_predictions', action='store_true', help='whether to overwrite previously written predictions')
+    parser.add_argument('--silent', action='store_true', help='whether to print predictions to stdout')
 
     args = parser.parse_args()
 
     with open(os.path.join(args.path, 'config.json')) as config_file:
         config = json.load(config_file)
-        retrieve = ['model', 'val_batch_size',
+        retrieve = ['model', 
                     'transformer_layers', 'rnn_layers', 'transformer_hidden', 
                     'dimension', 'load', 'max_val_context_length', 'val_batch_size', 
                     'transformer_heads', 'max_output_length', 'max_generative_vocab', 
-                    'lower']
+                    'lower', 'cove', 'intermediate_cove']
         for r in retrieve:
-            setattr(args, r,  config[r])
+            if r in config:
+                setattr(args, r,  config[r])
+            elif 'cove' in r:
+                setattr(args, r, False)
+            else:
+                setattr(args, r, None)
         args.dropout_ratio = 0.0
 
-#    args.metrics = ['lfem', 'joint_goal_em', 'turn_request_em', 'turn_goal_em', 'rouge_1', 'rouge_2', 'rougeL', 'avg_rouge', 'nf1', 'nem', 'bleu', 'corpus_f1', 'precision', 'recall']
-#    args.deca_metrics = ['lfem', 'joint_goal_em', 'avg_rouge', 'bleu', 'corpus_f1', 'nf1', 'nf1', 'em', 'em']
     args.task_to_metric = {'cnn_dailymail': 'avg_rouge',
         'iwslt.en.de': 'bleu',
-        'multinli.in.out': 'nem',
+        'multinli.in.out': 'em',
         'squad': 'nf1',
         'srl': 'nf1',
-        'sst': 'nf1',
+        'sst': 'em',
         'wikisql': 'lfem',
         'woz.en': 'joint_goal_em',
         'zre': 'corpus_f1',
-        'schema': 'nf1'}
-    args.best_checkpoint = get_best(args)
+        'schema': 'em'}
+
+    if os.path.exists(os.path.join(args.path, 'process_0.log')):
+        args.best_checkpoint = get_best(args)
+    else:
+        args.best_checkpoint = os.path.join(args.path, args.checkpoint_name)
+           
     return args
 
 
@@ -229,7 +270,14 @@ if __name__ == '__main__':
     print(f'Initializing Model')
     Model = getattr(models, args.model) 
     model = Model(field, args)
-    model.load_state_dict(save_dict['model_state_dict'])
+    model_dict = save_dict['model_state_dict']
+    backwards_compatible_cove_dict = {}
+    for k, v in model_dict.items():
+        if 'cove.rnn.' in k:
+            k = k.replace('cove.rnn.', 'cove.rnn1.')
+        backwards_compatible_cove_dict[k] = v
+    model_dict = backwards_compatible_cove_dict
+    model.load_state_dict(model_dict)
     field, splits = prepare_data(args, field)
     model.set_embeddings(field.vocab.vectors)
 

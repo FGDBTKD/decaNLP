@@ -5,9 +5,16 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.autograd import Variable
 
-from .common import positional_encodings_like, INF, EPSILON, TransformerEncoder, TransformerDecoder, PackedLSTM, LSTMDecoderAttention, LSTMDecoder, Embedding, Feedforward, mask
+from util import get_trainable_params
+
+from cove import MTLSTM
+from allennlp.modules.elmo import Elmo
+options_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
+weight_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
+
+
+from .common import positional_encodings_like, INF, EPSILON, TransformerEncoder, TransformerDecoder, PackedLSTM, LSTMDecoderAttention, LSTMDecoder, Embedding, Feedforward, mask, CoattentiveLayer
 
 
 class MultitaskQuestionAnsweringNetwork(nn.Module):
@@ -17,31 +24,41 @@ class MultitaskQuestionAnsweringNetwork(nn.Module):
         self.field = field
         self.args = args
         self.pad_idx = self.field.vocab.stoi[self.field.pad_token]
+        def dp(args):
+            return args.dropout_ratio if args.rnn_layers > 1 else 0.
 
         self.encoder_embeddings = Embedding(field, args.dimension, 
-            dropout=args.dropout_ratio)
+            dropout=args.dropout_ratio, project=not args.cove)
         self.decoder_embeddings = Embedding(field, args.dimension, 
-            dropout=args.dropout_ratio)
+            dropout=args.dropout_ratio, project=True)
+
+        if self.args.cove or self.args.intermediate_cove:
+            self.cove = MTLSTM(model_cache=args.embeddings, layer0=args.intermediate_cove, layer1=args.cove)
+            cove_params = get_trainable_params(self.cove) 
+            for p in cove_params:
+                p.requires_grad = False
+            cove_dim = int(args.intermediate_cove) * 600 + int(args.cove) * 600 + 400 # the last 400 is for GloVe and char n-gram embeddings
+            self.project_cove = Feedforward(cove_dim, args.dimension)
      
-        self.bilstm_before_coattention = PackedLSTM(args.dimension, args.dimension,
-            batch_first=True, dropout=args.dropout_ratio, bidirectional=True, num_layers=1)
+        self.bilstm_before_coattention = PackedLSTM(args.dimension,  args.dimension,
+            batch_first=True, bidirectional=True, num_layers=1, dropout=0)
         self.coattention = CoattentiveLayer(args.dimension, dropout=0.3)
         dim = 2*args.dimension + args.dimension + args.dimension
 
         self.context_bilstm_after_coattention = PackedLSTM(dim, args.dimension,
-            batch_first=True, dropout=args.dropout_ratio, bidirectional=True, 
+            batch_first=True, dropout=dp(args), bidirectional=True, 
             num_layers=args.rnn_layers)
         self.self_attentive_encoder_context = TransformerEncoder(args.dimension, args.transformer_heads, args.transformer_hidden, args.transformer_layers, args.dropout_ratio)
         self.bilstm_context = PackedLSTM(args.dimension, args.dimension,
-            batch_first=True, dropout=args.dropout_ratio, bidirectional=True, 
+            batch_first=True, dropout=dp(args), bidirectional=True, 
             num_layers=args.rnn_layers)
 
         self.question_bilstm_after_coattention = PackedLSTM(dim, args.dimension,
-            batch_first=True, dropout=args.dropout_ratio, bidirectional=True, 
+            batch_first=True, dropout=dp(args), bidirectional=True, 
             num_layers=args.rnn_layers)
         self.self_attentive_encoder_question = TransformerEncoder(args.dimension, args.transformer_heads, args.transformer_hidden, args.transformer_layers, args.dropout_ratio)
         self.bilstm_question = PackedLSTM(args.dimension, args.dimension,
-            batch_first=True, dropout=args.dropout_ratio, bidirectional=True, 
+            batch_first=True, dropout=dp(args), bidirectional=True, 
             num_layers=args.rnn_layers)
 
         self.self_attentive_decoder = TransformerDecoder(args.dimension, args.transformer_heads, args.transformer_hidden, args.transformer_layers, args.dropout_ratio)
@@ -69,6 +86,9 @@ class MultitaskQuestionAnsweringNetwork(nn.Module):
 
         context_embedded = self.encoder_embeddings(context)
         question_embedded = self.encoder_embeddings(question)
+        if self.args.cove:
+            context_embedded = self.project_cove(torch.cat([self.cove(context_embedded[:, :, -300:], context_lengths), context_embedded], -1).detach())
+            question_embedded = self.project_cove(torch.cat([self.cove(question_embedded[:, :, -300:], question_lengths), question_embedded], -1).detach())
 
         context_encoded = self.bilstm_before_coattention(context_embedded, context_lengths)[0]
         question_encoded = self.bilstm_before_coattention(question_embedded, question_lengths)[0]
@@ -78,14 +98,12 @@ class MultitaskQuestionAnsweringNetwork(nn.Module):
 
         coattended_context, coattended_question = self.coattention(context_encoded, question_encoded, context_padding, question_padding)
 
-#        context_summary = self.dropout(torch.cat([coattended_context, context_encoded, context_embedded], -1))
         context_summary = torch.cat([coattended_context, context_encoded, context_embedded], -1)
         condensed_context, _ = self.context_bilstm_after_coattention(context_summary, context_lengths)
         self_attended_context = self.self_attentive_encoder_context(condensed_context, padding=context_padding)
         final_context, (context_rnn_h, context_rnn_c) = self.bilstm_context(self_attended_context[-1], context_lengths)
         context_rnn_state = [self.reshape_rnn_state(x) for x in (context_rnn_h, context_rnn_c)]
 
-#        question_summary = self.dropout(torch.cat([coattended_question, question_encoded, question_embedded], -1))
         question_summary = torch.cat([coattended_question, question_encoded, question_embedded], -1)
         condensed_question, _ = self.question_bilstm_after_coattention(question_summary, question_lengths)
         self_attended_question = self.self_attentive_encoder_question(condensed_question, padding=question_padding)
@@ -143,37 +161,34 @@ class MultitaskQuestionAnsweringNetwork(nn.Module):
         effective_vocab_size = self.generative_vocab_size + len(oov_to_limited_idx)
         if self.generative_vocab_size < effective_vocab_size:
             size[-1] = effective_vocab_size - self.generative_vocab_size
-            buff = Variable(scaled_p_vocab.data.new(*size).fill_(EPSILON))
+            buff = scaled_p_vocab.new_full(size, EPSILON)
             scaled_p_vocab = torch.cat([scaled_p_vocab, buff], dim=buff.dim()-1)
 
-        p_context_ptr = Variable(scaled_p_vocab.data.new(*scaled_p_vocab.size()).fill_(EPSILON))
-        p_context_ptr.scatter_add_(p_context_ptr.dim()-1, context_indices.unsqueeze(1).expand_as(context_attention), context_attention)
-        scaled_p_context_ptr = (context_question_switches * (1 - vocab_pointer_switches)).expand_as(p_context_ptr) * p_context_ptr
+        # p_context_ptr
+        scaled_p_vocab.scatter_add_(scaled_p_vocab.dim()-1, context_indices.unsqueeze(1).expand_as(context_attention), 
+            (context_question_switches * (1 - vocab_pointer_switches)).expand_as(context_attention) * context_attention)
 
-        p_question_ptr = Variable(scaled_p_vocab.data.new(*scaled_p_vocab.size()).fill_(EPSILON))
-        p_question_ptr.scatter_add_(p_question_ptr.dim()-1, question_indices.unsqueeze(1).expand_as(question_attention), question_attention)
-        scaled_p_question_ptr = ((1 - context_question_switches) * (1 - vocab_pointer_switches)).expand_as(p_question_ptr) * p_question_ptr
+        # p_question_ptr
+        scaled_p_vocab.scatter_add_(scaled_p_vocab.dim()-1, question_indices.unsqueeze(1).expand_as(question_attention), 
+            ((1 - context_question_switches) * (1 - vocab_pointer_switches)).expand_as(question_attention) * question_attention)
 
-        probs = scaled_p_vocab + scaled_p_context_ptr + scaled_p_question_ptr
-        return probs
+        return scaled_p_vocab
 
 
     def greedy(self, self_attended_context, context, question, context_indices, question_indices, oov_to_limited_idx, rnn_state=None):
         B, TC, C = context.size()
         T = self.args.max_output_length
-        outs = Variable(context.data.new(B, T).long().fill_(
-            self.field.decoder_stoi['<pad>']), volatile=True)
-        hiddens = [Variable(self_attended_context[0].data.new(B, T, C).zero_(), volatile=True)
+        outs = context.new_full((B, T), self.field.decoder_stoi['<pad>'], dtype=torch.long)
+        hiddens = [self_attended_context[0].new_zeros((B, T, C))
                    for l in range(len(self.self_attentive_decoder.layers) + 1)]
         hiddens[0] = hiddens[0] + positional_encodings_like(hiddens[0])
-        eos_yet = context.data.new(B).byte().zero_()
-
+        eos_yet = context.new_zeros((B, )).byte()
+    
         rnn_output, context_alignment, question_alignment = None, None, None
         for t in range(T):
             if t == 0:
-                embedding = self.decoder_embeddings(Variable(
-                    self_attended_context[-1].data.new(B).long().fill_(
-                        self.field.vocab.stoi['<init>']), volatile=True).unsqueeze(1), [1]*B)
+                embedding = self.decoder_embeddings(
+                    self_attended_context[-1].new_full((B, 1), self.field.vocab.stoi['<init>'], dtype=torch.long), [1]*B)
             else:
                 embedding = self.decoder_embeddings(outs[:, t - 1].unsqueeze(1), [1]*B)
             hiddens[0][:, t] = hiddens[0][:, t] + (math.sqrt(self.self_attentive_decoder.d_model) * embedding).squeeze(1)
@@ -192,52 +207,14 @@ class MultitaskQuestionAnsweringNetwork(nn.Module):
                 context_indices, question_indices, 
                 oov_to_limited_idx)
             pred_probs, preds = probs.max(-1)
-            eos_yet = eos_yet | (preds.data == self.field.decoder_stoi['<eos>'])
-            outs[:, t] = Variable(preds.data.cpu().apply_(self.map_to_full), volatile=True)
+            preds = preds.squeeze(1)
+            eos_yet = eos_yet | (preds == self.field.decoder_stoi['<eos>'])
+            outs[:, t] = preds.cpu().apply_(self.map_to_full)
             if eos_yet.all():
                 break
         return outs
 
 
-class CoattentiveLayer(nn.Module):
-
-    def __init__(self, d, dropout=0.2):
-        super().__init__()
-        self.proj = Feedforward(d, d, dropout=0.0)
-        self.embed_sentinel = nn.Embedding(2, d)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, context, question, context_padding, question_padding): 
-        context_padding = torch.cat([context.data.new(context.size(0)).long().fill_(0).unsqueeze(1).long()==1, context_padding], 1)
-        question_padding = torch.cat([question.data.new(question.size(0)).long().fill_(0).unsqueeze(1)==1, question_padding], 1)
-
-        context_sentinel = self.embed_sentinel(Variable(context.data.new(context.size(0)).long().fill_(0)))
-        context = torch.cat([context_sentinel.unsqueeze(1), self.dropout(context)], 1) # batch_size x (context_length + 1) x features
-
-        question_sentinel = self.embed_sentinel(Variable(question.data.new(question.size(0)).long().fill_(1)))
-        question = torch.cat([question_sentinel.unsqueeze(1), question], 1) # batch_size x (question_length + 1) x features
-        question = F.tanh(self.proj(question)) # batch_size x (question_length + 1) x features
-
-        affinity = context.bmm(question.transpose(1,2)) # batch_size x (context_length + 1) x (question_length + 1)
-        attn_over_context = self.normalize(affinity, context_padding) # batch_size x (context_length + 1) x 1
-        attn_over_question = self.normalize(affinity.transpose(1,2), question_padding) # batch_size x (question_length + 1) x 1
-        sum_of_context = self.attn(attn_over_context, context) # batch_size x (question_length + 1) x features
-        sum_of_question = self.attn(attn_over_question, question) # batch_size x (context_length + 1) x features
-        coattn_context = self.attn(attn_over_question, sum_of_context) # batch_size x (context_length + 1) x features
-        coattn_question = self.attn(attn_over_context, sum_of_question) # batch_size x (question_length + 1) x features
-        return torch.cat([coattn_context, sum_of_question], 2)[:, 1:], torch.cat([coattn_question, sum_of_context], 2)[:, 1:]
-
-    @staticmethod
-    def attn(weights, candidates):
-        w1, w2, w3 = weights.size()
-        c1, c2, c3 = candidates.size()
-        return weights.unsqueeze(3).expand(w1, w2, w3, c3).mul(candidates.unsqueeze(2).expand(c1, c2, w3, c3)).sum(1).squeeze(1)
-
-    @staticmethod
-    def normalize(original, padding):
-        raw_scores = original.clone()
-        raw_scores.data.masked_fill_(padding.unsqueeze(-1).expand_as(raw_scores), -INF)
-        return F.softmax(raw_scores, dim=1)
 
 class DualPtrRNNDecoder(nn.Module):
 
@@ -295,7 +272,7 @@ class DualPtrRNNDecoder(nn.Module):
     def make_init_output(self, context):
         batch_size = context.size(0)
         h_size = (batch_size, self.d_hid)
-        return Variable(context.data.new(*h_size).zero_(), requires_grad=False)
+        return context.new_zeros(h_size)
 
     def package_outputs(self, outputs):
         outputs = torch.stack(outputs, dim=1)

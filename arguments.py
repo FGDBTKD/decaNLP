@@ -31,11 +31,12 @@ def parse():
 
     parser.add_argument('--train_tasks', nargs='+', type=str, help='tasks to use for training', required=True)
     parser.add_argument('--train_iterations', nargs='+', type=int, help='number of iterations to focus on each task')
-    parser.add_argument('--train_batch_tokens', nargs='+', default=[10000], type=int, help='Number of tokens to use for dynamic batching, corresponging to tasks in train tasks')
+    parser.add_argument('--train_batch_tokens', nargs='+', default=[9000], type=int, help='Number of tokens to use for dynamic batching, corresponging to tasks in train tasks')
     parser.add_argument('--jump_start', default=0, type=int, help='number of iterations to give jump started tasks')
     parser.add_argument('--n_jump_start', default=0, type=int, help='how many tasks to jump start (presented in order)')    
     parser.add_argument('--num_print', default=15, type=int, help='how many validation examples with greedy output to print to std out')
 
+    parser.add_argument('--tensorboard', action='store_true', help='Log to tensorboard; may slow down training') 
     parser.add_argument('--log_every', default=int(1e2), type=int, help='how often to log results in # of iterations')
     parser.add_argument('--save_every', default=int(1e3), type=int, help='how often to save a checkpoint in # of iterations')
 
@@ -62,6 +63,8 @@ def parse():
     parser.add_argument('--transformer_heads', default=3, type=int, help='number of heads for transformer modules')
     parser.add_argument('--dropout_ratio', default=0.2, type=float, help='dropout for the model')
     parser.add_argument('--no_transformer_lr', action='store_false', dest='transformer_lr', help='turns off the transformer learning rate strategy') 
+    parser.add_argument('--cove', action='store_true', help='whether to use contextualized word vectors (McCann et al. 2017)')
+    parser.add_argument('--intermediate_cove', action='store_true', help='whether to use the intermediate layers of contextualized word vectors (McCann et al. 2017)')
 
     parser.add_argument('--warmup', default=800, type=int, help='warmup for learning rate')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping')
@@ -71,7 +74,7 @@ def parse():
     parser.add_argument('--resume', action='store_true', help='whether to resume training with past optimizers')
 
     parser.add_argument('--seed', default=123, type=int, help='Random seed.')
-    parser.add_argument('--gpus', default=[0], nargs='+', type=int, help='a list of gpus that can be used for training (multi-gpu currently WIP)')
+    parser.add_argument('--devices', default=[0], nargs='+', type=int, help='a list of devices that can be used for training (multi-gpu currently WIP)')
     parser.add_argument('--backend', default='gloo', type=str, help='backend for distributed training')
 
     parser.add_argument('--no_commit', action='store_false', dest='commit', help='do not track the git commit associated with this training run') 
@@ -86,7 +89,7 @@ def parse():
         args.val_tasks = deepcopy(args.train_tasks)
     if 'imdb' in args.val_tasks:
         args.val_tasks.remove('imdb')
-    args.world_size = len(args.gpus) if args.gpus[0] > -1 else -1
+    args.world_size = len(args.devices) if args.devices[0] > -1 else -1
     if args.world_size > 1:
         print('multi-gpu training is currently a work in progress')
         return
